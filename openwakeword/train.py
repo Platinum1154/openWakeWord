@@ -1,7 +1,6 @@
 import torch
 from torch import optim, nn
 import torchinfo
-import torchmetrics
 import copy
 import os
 import sys
@@ -19,6 +18,22 @@ import openwakeword
 from openwakeword.data import generate_adversarial_texts, augment_clips, mmap_batch_generator
 from openwakeword.utils import compute_features_from_generator
 from openwakeword.utils import AudioFeatures
+
+
+def binary_recall(pred, target, threshold=0.5):
+    pred_positive = pred >= threshold
+    target_positive = target >= 0.5
+    true_positive = (pred_positive & target_positive).sum()
+    possible_positive = target_positive.sum()
+    if possible_positive == 0:
+        return torch.tensor(0.0, device=pred.device)
+    return true_positive.float() / possible_positive.float()
+
+
+def binary_accuracy(pred, target, threshold=0.5):
+    pred_positive = pred >= threshold
+    target_positive = target >= 0.5
+    return (pred_positive == target_positive).float().mean()
 
 
 # Base model class for an openwakeword model
@@ -98,8 +113,8 @@ class Model(nn.Module):
         # Define metrics
         if n_classes == 1:
             self.fp = lambda pred, y: (y-pred <= -0.5).sum()
-            self.recall = torchmetrics.Recall(task='binary')
-            self.accuracy = torchmetrics.Accuracy(task='binary')
+            self.recall = binary_recall
+            self.accuracy = binary_accuracy
         else:
             def multiclass_fp(p, y, threshold=0.5):
                 probs = torch.nn.functional.softmax(p, dim=1)
@@ -259,7 +274,7 @@ class Model(nn.Module):
         return best_model
 
     def auto_train(self, X_train, X_val, false_positive_val_data, steps=50000, max_negative_weight=1000,
-                   target_fp_per_hour=0.2):
+                   target_fp_per_hour=0.2, target_recall=None, max_extra_sequences=0):
         """A sequence of training steps that produce relatively strong models
         automatically, based on validation data and performance targets provided.
         After training merges the best checkpoints and returns a single model.
@@ -267,6 +282,7 @@ class Model(nn.Module):
 
         # Get false positive validation data duration
         val_set_hrs = 11.3
+        completed_sequences = 0
 
         # Sequence 1
         logging.info("#"*50 + "\nStarting training sequence 1...\n" + "#"*50)
@@ -281,6 +297,7 @@ class Model(nn.Module):
                     negative_weight_schedule=weights,
                     val_steps=val_steps, warmup_steps=steps//5,
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
+        completed_sequences += 1
 
         # Sequence 2
         logging.info("#"*50 + "\nStarting training sequence 2...\n" + "#"*50)
@@ -302,6 +319,7 @@ class Model(nn.Module):
                     negative_weight_schedule=weights,
                     val_steps=val_steps, warmup_steps=steps//5,
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
+        completed_sequences += 1
 
         # Sequence 3
         logging.info("#"*50 + "\nStarting training sequence 3...\n" + "#"*50)
@@ -322,6 +340,7 @@ class Model(nn.Module):
                     negative_weight_schedule=weights,
                     val_steps=val_steps, warmup_steps=steps//5,
                     hold_steps=steps//3, lr=lr, val_set_hrs=val_set_hrs)
+        completed_sequences += 1
 
         # Merge best models
         logging.info("Merging checkpoints above the 90th percentile into single model...")
@@ -363,7 +382,18 @@ class Model(nn.Module):
                      f"\nFinal Model Recall: {combined_model_recall}\nFinal Model False Positives per Hour: {combined_model_fp_per_hr}"
                      "\n################\n")
 
-        return combined_model
+        final_metrics = {
+            "accuracy": float(combined_model_accuracy),
+            "recall": float(combined_model_recall),
+            "false_positives_per_hour": float(combined_model_fp_per_hr),
+        }
+        stop_reason = (
+            "target_recall_reached"
+            if target_recall is not None and float(combined_model_recall) >= float(target_recall)
+            else "completed_standard_sequences"
+        )
+
+        return combined_model, final_metrics, stop_reason, completed_sequences
 
     def predict_on_features(self, features, model=None):
         """
@@ -520,6 +550,7 @@ class Model(nn.Module):
                         val_fp += self.fp(val_predictions, y_val[..., None])
                 val_fp_per_hr = (val_fp/val_set_hrs).detach().cpu().numpy()
                 self.history["val_fp_per_hr"].append(val_fp_per_hr)
+                self.best_val_fp = min(self.best_val_fp, float(val_fp_per_hr))
 
             # Get recall on test clips
             if step_ndx in val_steps and step_ndx > 1 and positive_test_clips is not None:
